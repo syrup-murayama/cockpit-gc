@@ -1,0 +1,7 @@
+interface:
+  display_name: "Cockpit GC"
+  short_description: "Diagnose and clean Cockpit task backlog"
+  default_prompt: "Use $cockpit-gc to scan Cockpit backlog and propose safe cleanup steps."
+
+policy:
+  allow_implicit_invocation: true
