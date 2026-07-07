@@ -1,5 +1,7 @@
 # cockpit-gc
 
+[日本語版 README](README_JA.md)
+
 Read-only AGI Cockpit task cleanup reporter, planner, and review helper.
 
 `cockpit-gc` is a small Python CLI plus Codex skill for people who use AGI
