@@ -7,11 +7,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .classify import classify_tasks, summarize
-from .cockpit import ask_multiple, complete_task, fetch_task_snippet, load_tasks
+from .cockpit import (
+    ask_multiple,
+    complete_task,
+    fetch_task_snippet,
+    load_tasks,
+    remove_task,
+)
+from . import state
+from .models import Category
 from .review import (
     compact_task_label,
     compact_waiting_label,
-    format_planned_completes,
     labels_to_task_ids,
     render_checklist,
     review_candidates,
@@ -87,6 +94,20 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _schedule_review_ask(action: str, summary: str, labels: list[str]) -> int:
+    ask_id = ask_multiple(summary, labels)
+    if not ask_id:
+        raise RuntimeError("cockpit ask returned no askId")
+    state.save_pending_ask(ask_id, action, labels)
+    print(f"Scheduled asynchronous ask: {ask_id}")
+    print("Wait for the cockpit.ask.resolved event, then run:")
+    print(
+        "PYTHONPATH=src python3 -m cockpit_gc "
+        f"resolve-ask {ask_id} --answers-json '<event JSON>'"
+    )
+    return 0
+
+
 def cmd_review_complete(args: argparse.Namespace) -> int:
     tasks = load_tasks()
     now = datetime.now(timezone.utc)
@@ -108,28 +129,11 @@ def cmd_review_complete(args: argparse.Namespace) -> int:
         print(render_checklist(labels), end="")
         return 0
 
-    selected_labels = ask_multiple(
+    return _schedule_review_ask(
+        "complete",
         "Select safe-to-complete tasks (cockpit-gc review-complete)",
         labels,
     )
-    task_ids = labels_to_task_ids(selected_labels)
-
-    if not args.apply:
-        print(format_planned_completes(task_ids), end="")
-        return 0
-
-    for task_id in task_ids:
-        complete_task(task_id)
-
-    lines = ["Completed tasks:"]
-    if task_ids:
-        for task_id in task_ids:
-            lines.append(f"- {task_id}")
-    else:
-        lines.append("- (none)")
-    lines.append("")
-    print("\n".join(lines), end="")
-    return 0
 
 
 def cmd_review_waiting(args: argparse.Namespace) -> int:
@@ -171,28 +175,134 @@ def cmd_review_waiting(args: argparse.Namespace) -> int:
         )
         return 0
 
-    selected_labels = ask_multiple(
+    return _schedule_review_ask(
+        "complete",
         "Select waiting_confirmation tasks (cockpit-gc review-waiting)",
         labels,
     )
-    task_ids = labels_to_task_ids(selected_labels)
 
-    if not args.apply:
-        print(format_planned_completes(task_ids), end="")
+
+def cmd_review_remove(args: argparse.Namespace) -> int:
+    tasks = load_tasks()
+    now = datetime.now(timezone.utc)
+    classified = classify_tasks(tasks, now)
+    candidates = review_candidates(
+        classified,
+        category=Category.SAFE_TO_REMOVE,
+        limit=args.limit,
+    )
+
+    if not candidates:
+        print("No safe-to-remove candidates.")
         return 0
 
-    for task_id in task_ids:
-        complete_task(task_id)
+    labels = [
+        compact_task_label(item, now=now)
+        for item in candidates
+    ]
+    if not args.ask:
+        print(
+            render_checklist(labels, title="Safe-to-remove review"),
+            end="",
+        )
+        return 0
 
-    lines = ["Completed tasks:"]
-    if task_ids:
-        for task_id in task_ids:
-            lines.append(f"- {task_id}")
+    return _schedule_review_ask(
+        "remove",
+        "Select safe-to-remove tasks (cockpit-gc review-remove)",
+        labels,
+    )
+
+
+def _decode_answers_json(raw: str) -> tuple[str, str | None, list[object]]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("--answers-json must contain valid JSON") from exc
+
+    if isinstance(payload, list):
+        return "answered", None, payload
+    if not isinstance(payload, dict):
+        raise RuntimeError("--answers-json must be an event object or answers array")
+
+    event_ask_id = payload.get("ask_id", payload.get("askId"))
+    if event_ask_id is not None and not isinstance(event_ask_id, str):
+        raise RuntimeError("cockpit.ask.resolved ask_id must be a string")
+
+    outcome = payload.get("outcome", "answered")
+    if not isinstance(outcome, str):
+        raise RuntimeError("cockpit.ask.resolved outcome must be a string")
+
+    if outcome == "dismissed":
+        return outcome, event_ask_id, []
+
+    if "answers" in payload:
+        answers = payload["answers"]
+    elif payload.get("type") == "choices":
+        answers = [payload]
     else:
-        lines.append("- (none)")
-    lines.append("")
-    print("\n".join(lines), end="")
-    return 0
+        answers = []
+    if not isinstance(answers, list):
+        raise RuntimeError("cockpit.ask.resolved answers must be an array")
+    return outcome, event_ask_id, answers
+
+
+def _selected_labels(
+    answers: list[object], allowed_labels: list[str]
+) -> list[str]:
+    if not answers or not isinstance(answers[0], dict):
+        return []
+    answer = answers[0]
+    if answer.get("type") != "choices":
+        return []
+    values = answer.get("values")
+    if not isinstance(values, list):
+        return []
+    allowed = set(allowed_labels)
+    return [value for value in values if isinstance(value, str) and value in allowed]
+
+
+def cmd_resolve_ask(args: argparse.Namespace) -> int:
+    pending = state.load_pending_ask(args.ask_id)
+    outcome, event_ask_id, answers = _decode_answers_json(args.answers_json)
+    if event_ask_id is not None and event_ask_id != args.ask_id:
+        raise RuntimeError(
+            f"resolved event ask_id {event_ask_id} does not match {args.ask_id}"
+        )
+
+    if outcome == "dismissed":
+        state.delete_pending_ask(args.ask_id)
+        print(f"Ask {args.ask_id} was dismissed; no tasks changed.")
+        return 0
+    if outcome != "answered":
+        raise RuntimeError(f"unsupported cockpit ask outcome: {outcome}")
+
+    labels = _selected_labels(answers, pending["labels"])
+    task_ids = labels_to_task_ids(labels)
+    action = pending["action"]
+    operation = complete_task if action == "complete" else remove_task
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+    try:
+        for task_id in task_ids:
+            try:
+                operation(task_id)
+            except Exception as exc:
+                failed.append((task_id, str(exc)))
+            else:
+                succeeded.append(task_id)
+    finally:
+        state.delete_pending_ask(args.ask_id)
+
+    lines = [
+        f"Resolved ask {args.ask_id} ({action}).",
+        f"Succeeded: {len(succeeded)}",
+    ]
+    lines.extend(f"- {task_id}" for task_id in succeeded)
+    lines.append(f"Failed: {len(failed)}")
+    lines.extend(f"- {task_id}: {error}" for task_id, error in failed)
+    print("\n".join(lines))
+    return 1 if failed else 0
 
 
 def cmd_apply(_args: argparse.Namespace) -> int:
@@ -250,12 +360,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_complete.add_argument(
         "--ask",
         action="store_true",
-        help="Use cockpit ask --multiple for checkbox selection",
-    )
-    review_complete.add_argument(
-        "--apply",
-        action="store_true",
-        help="Complete selected tasks (requires --ask)",
+        help="Schedule cockpit ask --multiple and persist its pending state",
     )
     review_complete.add_argument(
         "--with-snippet",
@@ -293,12 +398,7 @@ def build_parser() -> argparse.ArgumentParser:
     review_waiting.add_argument(
         "--ask",
         action="store_true",
-        help="Use cockpit ask --multiple for checkbox selection",
-    )
-    review_waiting.add_argument(
-        "--apply",
-        action="store_true",
-        help="Complete selected tasks (requires --ask)",
+        help="Schedule cockpit ask --multiple and persist its pending state",
     )
     review_waiting.add_argument(
         "--with-snippet",
@@ -306,6 +406,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fetch a short task tail via cockpit task get before showing labels",
     )
     review_waiting.set_defaults(func=cmd_review_waiting)
+
+    review_remove = subparsers.add_parser(
+        "review-remove",
+        help="Review safe-to-remove tasks with an optional interactive checklist",
+    )
+    review_remove.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum safe-to-remove candidates to show",
+    )
+    review_remove.add_argument(
+        "--ask",
+        action="store_true",
+        help="Schedule cockpit ask --multiple and persist its pending state",
+    )
+    review_remove.set_defaults(func=cmd_review_remove)
+
+    resolve_ask = subparsers.add_parser(
+        "resolve-ask",
+        help="Apply a resolved cockpit.ask.resolved event to a pending review",
+    )
+    resolve_ask.add_argument("ask_id", help="askId printed by a review --ask command")
+    resolve_ask.add_argument(
+        "--answers-json",
+        required=True,
+        help="Resolved event JSON or its answers array",
+    )
+    resolve_ask.set_defaults(func=cmd_resolve_ask)
 
     return parser
 

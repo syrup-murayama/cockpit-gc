@@ -2,7 +2,7 @@
 
 AGI Cockpit のタスク履歴が増えすぎたときに、状態を読み取り、整理候補を分類し、人間が確認しながら片付けるための小さな Python CLI + Codex skill です。
 
-`cockpit-gc` は削除ツールではありません。まず `scan` と `plan` で現状を把握し、必要な場合だけ `--apply` 付きの明示的なフローで選択済みタスクを完了します。
+`cockpit-gc` は削除ツールではありません。まず `scan` と `plan` で現状を把握します。対話的な整理は `cockpit ask` が非同期で解決されるため、`--ask` でダイアログをスケジュールし、後から届く `cockpit.ask.resolved` イベントを `resolve-ask` に渡す2段階フローです。
 
 ## できること
 
@@ -54,6 +54,8 @@ PYTHONPATH=src python3 -m cockpit_gc scan
 PYTHONPATH=src python3 -m cockpit_gc plan
 PYTHONPATH=src python3 -m cockpit_gc review-complete
 PYTHONPATH=src python3 -m cockpit_gc review-waiting
+PYTHONPATH=src python3 -m cockpit_gc review-remove
+PYTHONPATH=src python3 -m cockpit_gc resolve-ask ASK_ID --answers-json '...'
 ```
 
 レポートを `reports/` に保存する場合:
@@ -75,30 +77,52 @@ PYTHONPATH=src python3 -m cockpit_gc plan
 古い `waiting_confirmation` をチェックリストで確認するだけなら:
 
 ```bash
-PYTHONPATH=src python3 -m cockpit_gc review-waiting --stale-days 7 --with-snippet --ask
+PYTHONPATH=src python3 -m cockpit_gc review-waiting --stale-days 7 --with-snippet
 ```
 
-選択したタスクを本当に完了する場合だけ `--apply` を付けます。
+選択ダイアログをスケジュールするフェーズ1は `--ask` で実行します。
 
 ```bash
-PYTHONPATH=src python3 -m cockpit_gc review-waiting --include-needs-resume --ask --apply
+PYTHONPATH=src python3 -m cockpit_gc review-waiting --include-needs-resume --ask
 ```
 
-このコマンドは Cockpit のチェックボックスで選択した task ID だけを `complete` します。
+コマンドは `askId` を表示し、提示したラベルを
+`.cockpit_gc_state/pending_asks/<askId>.json` に保存して即終了します。
+このプロセス自身は後から届くイベントを受け取れません。呼び出し元の
+エージェントに `cockpit.ask.resolved` が新しいターンとして届いたら、
+そのJSON全体（または `answers` 配列）をフェーズ2へ渡します。
+
+```bash
+PYTHONPATH=src python3 -m cockpit_gc resolve-ask ask_xxx \
+  --answers-json '{"event":"cockpit.ask.resolved","ask_id":"ask_xxx","outcome":"answered","answers":[{"type":"choices","values":["..."]}]}'
+```
+
+`resolve-ask` は、その `askId` の状態に保存されたラベルだけを task ID に
+変換します。`dismissed` の場合は何も変更しません。状態ファイルは、
+dismissed または選択タスクの処理後に削除されます。
+
+`review-complete` は `safe-to-complete` の候補、`review-waiting` は古い
+`waiting_confirmation` の候補を扱います。どちらも `--ask` はスケジュール
+だけを行い、実際の `complete` は `resolve-ask` が担当します。
+
+`review-remove` は `safe-to-remove` 候補を扱います。`--apply` フラグは
+存在せず、`--ask` → 明示的な選択イベント → `resolve-ask` の流れだけで
+`remove` を実行します。
 
 ## 安全設計
 
 - デフォルトは読み取り専用です
 - Cockpit が起動中か確認してから `cockpit` CLI を呼びます
-- `--apply` なしではタスク状態を変更しません
+- `review-* --ask` は非同期 ask のスケジュールと状態保存だけを行います
+- `resolve-ask` は answered イベントに含まれ、保存済み候補にも一致するラベルだけを処理します
 - `cockpit-gc apply` は意図的に未実装です
 - orphan process を検出することはありますが、kill はしません
-- `remove` は基本的に推奨せず、まず `complete` を優先します
+- `remove` は基本的に推奨せず、まず `complete` を優先します。明示的な選択なしには実行しません
 
 ## テスト
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m pytest
 ```
 
 ## ステータス

@@ -1,4 +1,4 @@
-"""Read-only AGI Cockpit task cleanup reporter."""
+"""Conservative AGI Cockpit task cleanup reporter and review helper."""
 
 __all__ = ["__version__"]
 
