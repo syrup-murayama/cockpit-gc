@@ -23,6 +23,7 @@ from cockpit_gc.cockpit import (
     is_cockpit_running,
     is_process_running,
     load_tasks,
+    remove_task,
 )
 
 
@@ -54,17 +55,17 @@ class CockpitMutationTests(unittest.TestCase):
     def test_ask_multiple_builds_expected_args(self):
         response = {
             "ok": True,
-            "data": {"type": "choices", "values": ["abc | terminal | waiting"]},
+            "data": {"askId": "ask_abc123", "status": "scheduled"},
         }
         with mock.patch("cockpit_gc.cockpit.is_cockpit_running", return_value=True):
             with mock.patch(
                 "cockpit_gc.cockpit.run_cockpit", return_value=response
             ) as run_mock:
-                selected = ask_multiple(
+                ask_id = ask_multiple(
                     "Pick tasks",
                     ["abc | terminal | waiting", "def | terminal | waiting"],
                 )
-        self.assertEqual(selected, ["abc | terminal | waiting"])
+        self.assertEqual(ask_id, "ask_abc123")
         run_mock.assert_called_once_with(
             [
                 "ask",
@@ -78,11 +79,27 @@ class CockpitMutationTests(unittest.TestCase):
             ]
         )
 
+    def test_ask_multiple_rejects_response_without_ask_id(self):
+        response = {"ok": True, "data": {"status": "scheduled"}}
+        with mock.patch("cockpit_gc.cockpit.is_cockpit_running", return_value=True):
+            with mock.patch(
+                "cockpit_gc.cockpit.run_cockpit", return_value=response
+            ):
+                with self.assertRaises(RuntimeError) as ctx:
+                    ask_multiple("Pick tasks", ["choice"])
+        self.assertIn("askId", str(ctx.exception))
+
     def test_complete_task_builds_expected_args(self):
         with mock.patch("cockpit_gc.cockpit.is_cockpit_running", return_value=True):
             with mock.patch("cockpit_gc.cockpit.run_cockpit") as run_mock:
                 complete_task("abc123")
         run_mock.assert_called_once_with(["task", "complete", "abc123"])
+
+    def test_remove_task_builds_expected_args(self):
+        with mock.patch("cockpit_gc.cockpit.is_cockpit_running", return_value=True):
+            with mock.patch("cockpit_gc.cockpit.run_cockpit") as run_mock:
+                remove_task("abc123")
+        run_mock.assert_called_once_with(["task", "remove", "abc123"])
 
     def test_fetch_task_snippet_builds_expected_args(self):
         response = {
@@ -106,6 +123,12 @@ class CockpitMutationTests(unittest.TestCase):
         with mock.patch("cockpit_gc.cockpit.is_cockpit_running", return_value=False):
             with self.assertRaises(RuntimeError) as ctx:
                 ask_multiple("summary", ["choice"])
+        self.assertIn("not running", str(ctx.exception))
+
+    def test_remove_task_refuses_when_cockpit_not_running(self):
+        with mock.patch("cockpit_gc.cockpit.is_cockpit_running", return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                remove_task("abc123")
         self.assertIn("not running", str(ctx.exception))
 
 

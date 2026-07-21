@@ -2,5 +2,6 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.cockpit_gc_state/
 reports/*.md
 !reports/.gitkeep

@@ -92,9 +92,9 @@ def fetch_task_snippet(task_id: str, max_lines: int = 40) -> str:
     return " ".join(parts).strip()
 
 
-def ask_multiple(summary: str, choices: list[str]) -> list[str]:
+def ask_multiple(summary: str, choices: list[str]) -> str:
     if not choices:
-        return []
+        return ""
     if not is_cockpit_running():
         raise RuntimeError(
             "AGI Cockpit is not running; refusing to auto-start it via cockpit CLI"
@@ -105,13 +105,12 @@ def ask_multiple(summary: str, choices: list[str]) -> list[str]:
         args.extend(["--choice", choice])
     payload = run_cockpit(args)
     data = payload.get("data")
-    if not isinstance(data, dict):
-        return []
-    if data.get("type") == "choices":
-        values = data.get("values")
-        if isinstance(values, list):
-            return [str(value) for value in values]
-    return []
+    if not isinstance(data, dict) or not isinstance(data.get("askId"), str):
+        raise RuntimeError("unexpected cockpit ask response: missing askId")
+    ask_id = data["askId"].strip()
+    if not ask_id:
+        raise RuntimeError("unexpected cockpit ask response: empty askId")
+    return ask_id
 
 
 def complete_task(task_id: str) -> None:
@@ -120,3 +119,11 @@ def complete_task(task_id: str) -> None:
             "AGI Cockpit is not running; refusing to auto-start it via cockpit CLI"
         )
     run_cockpit(["task", "complete", task_id])
+
+
+def remove_task(task_id: str) -> None:
+    if not is_cockpit_running():
+        raise RuntimeError(
+            "AGI Cockpit is not running; refusing to auto-start it via cockpit CLI"
+        )
+    run_cockpit(["task", "remove", task_id])

@@ -1,7 +1,7 @@
 [project]
 name = "cockpit-gc"
 version = "0.1.0"
-description = "Read-only AGI Cockpit task cleanup reporter"
+description = "Conservative AGI Cockpit task cleanup reporter and review helper"
 requires-python = ">=3.10"
 dependencies = []
 
