@@ -2,7 +2,7 @@
 
 [日本語版 README](README_JA.md)
 
-Read-only AGI Cockpit task cleanup reporter, planner, and review helper.
+Conservative AGI Cockpit task cleanup reporter, planner, and review helper.
 
 `cockpit-gc` is a small Python CLI plus Codex skill for people who use AGI
 Cockpit long enough for task history to pile up. It helps answer:
@@ -12,8 +12,10 @@ Cockpit long enough for task history to pile up. It helps answer:
 - Which completed/tmp tasks look safe to archive or remove later?
 - Which candidates should a human review before completing?
 
-The tool is intentionally conservative: it scans and plans first, and only
-changes Cockpit task state when an explicit `--apply` flow is used.
+The tool is intentionally conservative: it scans and plans first. Interactive
+cleanup is a two-phase flow because `cockpit ask` resolves asynchronously:
+`--ask` schedules the checkbox dialog and `resolve-ask` applies only the labels
+returned by the later `cockpit.ask.resolved` event.
 
 ## Requirements
 
@@ -61,6 +63,8 @@ PYTHONPATH=src python3 -m cockpit_gc scan     # health scan (Markdown default, -
 PYTHONPATH=src python3 -m cockpit_gc plan       # categorized cleanup candidates
 PYTHONPATH=src python3 -m cockpit_gc review-complete  # safe-to-complete checklist (read-only)
 PYTHONPATH=src python3 -m cockpit_gc review-waiting   # stale waiting_confirmation checklist (read-only)
+PYTHONPATH=src python3 -m cockpit_gc review-remove    # safe-to-remove checklist (read-only)
+PYTHONPATH=src python3 -m cockpit_gc resolve-ask ASK_ID --answers-json '...'
 PYTHONPATH=src python3 -m cockpit_gc apply    # not implemented by design
 ```
 
@@ -78,25 +82,46 @@ PYTHONPATH=src python3 -m cockpit_gc plan
 Review stale waiting tasks without changing anything:
 
 ```bash
-PYTHONPATH=src python3 -m cockpit_gc review-waiting --stale-days 7 --with-snippet --ask
+PYTHONPATH=src python3 -m cockpit_gc review-waiting --stale-days 7 --with-snippet
 ```
 
-If you intentionally want to complete selected tasks, use the interactive
-checkbox flow with `--apply`:
+To schedule an interactive completion review, run phase 1 with `--ask`:
 
 ```bash
-PYTHONPATH=src python3 -m cockpit_gc review-waiting --include-needs-resume --ask --apply
+PYTHONPATH=src python3 -m cockpit_gc review-waiting --include-needs-resume --ask
 ```
 
-`review-complete` shows only `safe-to-complete` candidates. Without `--ask`, it prints a Markdown checklist and makes no changes. With `--ask`, it uses `cockpit ask --multiple` for checkbox selection. With `--ask --apply`, it completes only the selected task IDs.
+The command prints an `askId` and stores the offered labels in
+`.cockpit_gc_state/pending_asks/<askId>.json`. It exits immediately; the Python
+process that scheduled the ask cannot receive the later Cockpit event. When the
+calling agent receives `cockpit.ask.resolved` as a new turn, pass that event to
+phase 2:
 
-`review-waiting` reviews broader stale `waiting_confirmation` tasks (default: last activity at least 3 days ago). Use `--include-needs-resume` to include tasks that need resume. It follows the same read-only / `--ask` / `--ask --apply` safety model as `review-complete`.
+```bash
+PYTHONPATH=src python3 -m cockpit_gc resolve-ask ask_xxx \
+  --answers-json '{"event":"cockpit.ask.resolved","ask_id":"ask_xxx","outcome":"answered","answers":[{"type":"choices","values":["..."]}]}'
+```
+
+`resolve-ask` maps only labels saved for that `askId` to task IDs. A dismissed
+ask is a no-op. The state file is removed after dismissal or after all selected
+tasks have been attempted.
+
+`review-complete` shows only `safe-to-complete` candidates. Without `--ask`, it
+prints a Markdown checklist and makes no changes. With `--ask`, it schedules
+the asynchronous phase-1 dialog; it does not complete tasks in that process.
+
+`review-waiting` reviews broader stale `waiting_confirmation` tasks (default:
+last activity at least 3 days ago). Use `--include-needs-resume` to include
+tasks that need resume. It follows the same read-only / phase-1 `--ask` /
+phase-2 `resolve-ask` model as `review-complete`.
+
+`review-remove` shows `safe-to-remove` candidates. It has no `--apply` flag;
+use `--ask` followed by `resolve-ask` after an explicit checkbox answer.
 
 ```bash
 PYTHONPATH=src python3 -m cockpit_gc review-complete
 PYTHONPATH=src python3 -m cockpit_gc review-complete --limit 10
 PYTHONPATH=src python3 -m cockpit_gc review-complete --ask
-PYTHONPATH=src python3 -m cockpit_gc review-complete --ask --apply
 PYTHONPATH=src python3 -m cockpit_gc review-complete --with-snippet --ask
 
 PYTHONPATH=src python3 -m cockpit_gc review-waiting
@@ -104,17 +129,20 @@ PYTHONPATH=src python3 -m cockpit_gc review-waiting --limit 50
 PYTHONPATH=src python3 -m cockpit_gc review-waiting --stale-days 7 --limit 50
 PYTHONPATH=src python3 -m cockpit_gc review-waiting --include-needs-resume --limit 50
 PYTHONPATH=src python3 -m cockpit_gc review-waiting --with-snippet --ask
-PYTHONPATH=src python3 -m cockpit_gc review-waiting --ask --apply
+
+PYTHONPATH=src python3 -m cockpit_gc review-remove
+PYTHONPATH=src python3 -m cockpit_gc review-remove --limit 10 --ask
 ```
 
 ## Safety
 
 - Default is read-only.
 - Cockpit must already be running; the CLI checks `~/.agi-tools/data/cockpit/cli-runtime.json` PID before calling `cockpit`.
-- `review-complete` changes Cockpit state only with both `--ask` and `--apply`, and only for checkbox-selected task IDs.
-- `review-waiting` follows the same rule. Prefer reviewing with `--stale-days` before broad cleanup.
+- `review-complete` and `review-waiting` `--ask` only schedule an asynchronous dialog and persist its label mapping; they do not change task state.
+- `resolve-ask` changes state only for labels returned by an answered Cockpit event. Prefer reviewing with `--stale-days` before broad cleanup.
+- `review-remove` uses the same explicit answered-event flow and never removes tasks without selected labels.
 - `cockpit-gc apply` is intentionally not implemented.
-- Never complete or remove tasks without explicit `--apply` and human review.
+- Never complete or remove tasks without an explicit checkbox answer and human review.
 - The tool may list orphan processes, but it never kills them.
 
 ## Codex Skill
@@ -126,7 +154,7 @@ user explicitly approves selected task IDs.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests
+python3 -m pytest
 ```
 
 ## Status
